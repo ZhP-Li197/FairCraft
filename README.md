@@ -2,18 +2,6 @@
 
 Implementation of the AgentFGL paper for fair learning on text-attributed graphs.
 
-## Method Overview
-
-**Stage 1: Multi-Agent Text Refinement**
-- Bias Diagnosis Agent: Identifies task-relevant content and sensitive patterns
-- Rewriting Planning Agent: Generates explicit rewriting instructions
-- Fairness-aware Generation Agent: Produces fairness-aware text
-- Semantic Verification Agent: Evaluates quality with iterative feedback
-
-**Stage 2: Topology Debiasing**
-- Embedding Retrieval: BERT-based candidate edge retrieval
-- LLM Edge Reasoning: Joint evaluation of task semantics and sensitive tendencies
-- Graph Editor: Budget-constrained graph editing
 
 ## Quick Start
 
