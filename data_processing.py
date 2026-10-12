@@ -1,223 +1,148 @@
-"""
-Data Processing Module
-
-功能：加载和预处理图数据
-- 加载CSV和边文件
-- 构建图数据结构
-- 复用occupations/occ_data_processing.py的逻辑
-"""
-
-import pandas as pd
+from __future__ import annotations
+import csv
+import hashlib
+import json
+import random
+from dataclasses import dataclass
+from pathlib import Path
 import numpy as np
-import scipy.sparse as sp
-import torch
-import os
-from typing import Tuple, Dict, Set
-import sys
-sys.path.append(os.path.dirname(__file__))
-
-from utils import setup_logger, clean_one_line_text
+from common import atomic_json
 
 
-class DataProcessor:
-    """数据处理器"""
+@dataclass
+class GraphData:
+    ids: list[str]
+    texts: list[str]
+    labels: np.ndarray
+    sensitive: np.ndarray
+    edges: set[tuple[int, int]]
+    train: np.ndarray
+    val: np.ndarray
+    test: np.ndarray
+    sensitive_train: np.ndarray
 
-    def __init__(
-        self,
-        csv_path: str,
-        edges_path: str,
-        verbose: bool = True
-    ):
-        self.csv_path = csv_path
-        self.edges_path = edges_path
-        self.verbose = verbose
-        self.logger = setup_logger("DataProcessor")
+    @property
+    def n(self):
+        return len(self.ids)
 
-        self.df = None
-        self.idx_map = {}  # user_id -> index
-        self.idx_to_id = {}  # index -> user_id
-        self.edges = []
-        self.edge_set = set()
-        self.adjacency = {}  # index -> set(neighbor_indices)
+    def neighbors(self):
+        result = [set() for _ in self.ids]
+        for i, j in self.edges:
+            result[i].add(j)
+            result[j].add(i)
+        return result
 
-    def load_data(self) -> pd.DataFrame:
-        """加载用户数据"""
-        self.logger.info(f"Loading用户数据: {self.csv_path}")
 
-        if not os.path.exists(self.csv_path):
-            raise FileNotFoundError(f"找不到文件: {self.csv_path}")
+def source_hash(paths):
+    h = hashlib.sha256()
+    for path in paths:
+        with open(path, 'rb') as f:
+            for block in iter(lambda: f.read(1024 * 1024), b''):
+                h.update(block)
+    return h.hexdigest()
 
-        df = pd.read_csv(self.csv_path, dtype=str, low_memory=False)
 
-        unnamed_cols = [c for c in df.columns if str(c).startswith("Unnamed")]
-        if unnamed_cols:
-            df = df.drop(columns=unnamed_cols)
+def make_splits(n, config, seed):
+    if not 0 < config['train_ratio'] < 1 or not 0 < config['val_ratio'] < 1:
+        raise ValueError('Invalid train/validation ratios')
+    order = np.random.RandomState(seed).permutation(n)
+    a = int(n * config['train_ratio'])
+    b = int(n * (config['train_ratio'] + config['val_ratio']))
+    if not 0 < a < b < n:
+        raise ValueError('Need nonempty training, validation and test subsets')
+    train, val, test = order[:a], order[a:b], order[b:]
+    observed = sorted(train.tolist())
+    random.Random(seed).shuffle(observed)
+    return dict(train=train.tolist(), val=val.tolist(), test=test.tolist(),
+                sensitive_train=observed[:config['sensitive_train_count']])
 
-        required_cols = ["id", "tweet", "gender", "flag"]
-        missing = [c for c in required_cols if c not in df.columns]
-        if missing:
-            raise ValueError(f"CSV文件缺少必要列: {missing}")
 
-        for col in required_cols:
-            df[col] = df[col].replace(r'^\s*$', pd.NA, regex=True)
-            df[col] = df[col].replace(['nan', 'NaN', 'None', 'none', 'NULL', 'null'], pd.NA)
+def validate_splits(split, n):
+    for name in ('train', 'val', 'test', 'sensitive_train'):
+        if name not in split:
+            raise ValueError(f'Missing split: {name}')
+        values = split[name]
+        if any(type(i) is not int or i < 0 or i >= n for i in values):
+            raise ValueError(f'Invalid indices in {name}')
+        if len(set(values)) != len(values):
+            raise ValueError(f'Duplicate indices in {name}')
+    sets = [set(split[k]) for k in ('train', 'val', 'test')]
+    if any(not s for s in sets) or len(set.union(*sets)) != n or sum(map(len, sets)) != n:
+        raise ValueError('Train/val/test must form a nonempty disjoint partition')
+    if not set(split['sensitive_train']).issubset(sets[0]):
+        raise ValueError('Sensitive training annotations must be restricted to training nodes')
 
-        df['id'] = df['id'].astype(str)
 
-        before = len(df)
-        df = df.dropna(subset=required_cols).copy()
-        self.logger.info(f"Removed缺失值: {before - len(df)} 行")
+def load_data(config):
+    data_cfg = config['data']
+    spec = config['datasets'][data_cfg['dataset']]
+    directory = Path(data_cfg['root']) / spec['directory']
+    ids, texts, labels, sensitive = [], [], [], []
+    seen = set()
+    missing = {'', 'nan', 'none', 'null'}
 
-        dup_num = df['id'].duplicated().sum()
-        if dup_num > 0:
-            self.logger.warning(f"发现重复ID: {dup_num}，只保留第一条")
-            df = df.drop_duplicates(subset=['id'], keep='first').copy()
+    csv.field_size_limit(1024 * 1024 * 1024)
+    with open(directory / spec['csv'], encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f)
+        required = [spec[k] for k in ('id_column', 'text_column', 'label_column', 'sensitive_column')]
+        if not set(required).issubset(reader.fieldnames or []):
+            raise ValueError(f'CSV missing required columns: {required}')
+        for row in reader:
+            uid, text, y, s = [str(row.get(k) or '').strip() for k in required]
+            if any(v.lower() in missing for v in (uid, text, y, s)):
+                continue
+            mapping = spec['sensitive_mapping']
+            try:
+                yf = float(y)
+                sf = mapping[s.lower()] if mapping else float(s)
+                if yf not in (0, 1) or sf not in (0, 1):
+                    raise ValueError('nonbinary')
+            except (ValueError, KeyError):
+                continue
 
-        df['tweet'] = df['tweet'].fillna("").apply(clean_one_line_text)
+            if uid in seen:
+                continue
+            seen.add(uid)
+            ids.append(uid)
+            texts.append(' '.join(text.split()))
+            labels.append(int(yf))
+            sensitive.append(int(sf))
+    index = {uid: i for i, uid in enumerate(ids)}
+    edges = set()
+    with open(directory / spec['edges'], encoding='utf-8') as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 2 or parts[0] not in index or parts[1] not in index:
+                continue
+            i, j = index[parts[0]], index[parts[1]]
+            if i != j:
+                edges.add(tuple(sorted((i, j))))
+    if not edges:
+        raise ValueError('No valid edges; check original string ID alignment')
+    split_file = data_cfg.get('split_file')
+    if split_file:
+        saved = json.loads(Path(split_file).read_text())
+        if saved.get('ids') != ids:
+            raise ValueError('split_file must include the identical ordered ids list')
+        split = {k: saved[k] for k in ('train', 'val', 'test', 'sensitive_train')}
+    else:
+        split = make_splits(len(ids), data_cfg, config['seed'])
+    validate_splits(split, len(ids))
+    return GraphData(ids, texts, np.array(labels), np.array(sensitive), edges,
+                     **{k: np.array(v, dtype=np.int64) for k, v in split.items()})
 
-        df = df[df['tweet'].str.strip() != ""]
 
-        df['gender'] = df['gender'].astype(str).str.strip().str.lower()
-        df = df[df['gender'].isin(['male', 'female'])]
+def demo_data(seed=20):
+    n = 24
+    ids = [f'demo-{i}' for i in range(n)]
+    texts = [f'I work on {"software programming" if i % 2 else "sales marketing"} project {i}.' for i in range(n)]
+    edges = {tuple(sorted((i, (i + d) % n))) for i in range(n) for d in (1, 2)}
+    splits = make_splits(n, {'train_ratio': .5, 'val_ratio': .25, 'sensitive_train_count': 12}, seed)
+    return GraphData(ids, texts, np.array([i % 2 for i in range(n)]),
+                     np.array([(i // 2) % 2 for i in range(n)]), edges,
+                     **{k: np.array(v, dtype=np.int64) for k, v in splits.items()})
 
-        df['flag'] = pd.to_numeric(df['flag'], errors='coerce').fillna(-1).astype(int)
-        df = df[df['flag'].isin([0, 1])]
 
-        df = df.reset_index(drop=True)
-
-        self.logger.info(f"Loading完成: {len(df)} 个用户")
-        self.logger.info(f"Gender分布: {df['gender'].value_counts().to_dict()}")
-        self.logger.info(f"Flag分布: {df['flag'].value_counts().to_dict()}")
-
-        self.df = df
-
-        self.idx_map = {uid: i for i, uid in enumerate(df['id'].values)}
-        self.idx_to_id = {i: uid for uid, i in self.idx_map.items()}
-
-        return df
-
-    def load_edges(self) -> Tuple[list, Set]:
-        """加载边数据"""
-        self.logger.info(f"Loading边数据: {self.edges_path}")
-
-        if not os.path.exists(self.edges_path):
-            raise FileNotFoundError(f"找不到边文件: {self.edges_path}")
-
-        edges = []
-        edge_set = set()
-        adjacency = {i: set() for i in range(len(self.df))}
-
-        with open(self.edges_path, 'r') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 2:
-                    src_id = parts[0]
-                    dst_id = parts[1]
-
-                    src_idx = self.idx_map.get(src_id)
-                    dst_idx = self.idx_map.get(dst_id)
-
-                    if src_idx is not None and dst_idx is not None:
-                        edges.append((src_idx, dst_idx))
-                        edge = tuple(sorted([src_idx, dst_idx]))
-                        edge_set.add(edge)
-
-                        adjacency[src_idx].add(dst_idx)
-                        adjacency[dst_idx].add(src_idx)
-
-        self.edges = edges
-        self.edge_set = edge_set
-        self.adjacency = adjacency
-
-        self.logger.info(f"Loading完成: {len(edges)} 条边, {len(edge_set)} 条去重边")
-
-        return edges, edge_set
-
-    def build_adjacency_matrix(self) -> sp.csr_matrix:
-        """构建邻接矩阵"""
-        self.logger.info("构建邻接矩阵...")
-
-        num_nodes = len(self.df)
-        edges_array = np.array(self.edges, dtype=int)
-
-        adj = sp.coo_matrix(
-            (np.ones(edges_array.shape[0]), (edges_array[:, 0], edges_array[:, 1])),
-            shape=(num_nodes, num_nodes),
-            dtype=np.float32
-        )
-
-        adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
-
-        adj = adj + sp.eye(adj.shape[0])
-
-        self.logger.info(f"邻接矩阵构建完成: shape={adj.shape}, nnz={adj.nnz}")
-
-        return adj
-
-    def get_node_attributes(self) -> Dict[str, Dict]:
-        """获取节点属性字典"""
-        if self.df is None:
-            raise ValueError("请先调用load_data()")
-
-        node_attrs = {}
-        for _, row in self.df.iterrows():
-            node_attrs[row['id']] = {
-                'gender': row['gender'],
-                'flag': int(row['flag']),
-                'tweet': row['tweet']
-            }
-
-        return node_attrs
-
-    def get_edge_set_by_id(self) -> Set[Tuple[str, str]]:
-        """获取以ID表示的边集"""
-        edge_set_id = set()
-        for i, j in self.edge_set:
-            src_id = self.idx_to_id[i]
-            dst_id = self.idx_to_id[j]
-            edge_set_id.add(tuple(sorted([src_id, dst_id])))
-
-        return edge_set_id
-
-    def save_edges(self, edge_set: Set[Tuple[str, str]], output_path: str):
-        """保存边文件"""
-        self.logger.info(f"保存边文件: {output_path}")
-
-        with open(output_path, 'w') as f:
-            for src, dst in edge_set:
-                f.write(f"{src} {dst}\n")
-
-        self.logger.info(f"保存完成: {len(edge_set)} 条边")
-
-    def save_graph_pkl(
-        self,
-        output_path: str,
-        features: torch.Tensor,
-        labels: torch.Tensor,
-        sens: torch.Tensor,
-        adj: sp.csr_matrix,
-        idx_train: torch.Tensor,
-        idx_val: torch.Tensor,
-        idx_test: torch.Tensor,
-        idx_sens_train: torch.Tensor
-    ):
-        """保存图数据到PKL"""
-        import pickle
-
-        self.logger.info(f"保存图数据: {output_path}")
-
-        data = {
-            'adj': adj,
-            'features': features,
-            'labels': labels,
-            'sens': sens,
-            'idx_train': idx_train,
-            'idx_val': idx_val,
-            'idx_test': idx_test,
-            'idx_sens_train': idx_sens_train
-        }
-
-        with open(output_path, 'wb') as f:
-            pickle.dump(data, f)
-
-        self.logger.info("图数据保存完成")
+def save_splits(data, path):
+    atomic_json(path, {'ids': data.ids, **{k: getattr(data, k).tolist()
+                                        for k in ('train', 'val', 'test', 'sensitive_train')}})

@@ -1,0 +1,83 @@
+{
+  "seed": 20,
+  "device": "auto",
+  "output_dir": "outputs/faircraft",
+  "llm": {
+    "base_url": "http://localhost:8000/v1",
+    "api_key": "",
+    "api_key_env": "FAIRCRAFT_API_KEY",
+    "model": "Qwen3.6-27B",
+    "temperature": 0.2,
+    "max_tokens": 4096,
+    "timeout": 180,
+    "transport_attempts": 3,
+    "retry_delay": 2,
+    "extra_body": {}
+  },
+  "encoder": {
+    "model": "sentence-transformers/all-mpnet-base-v2",
+    "batch_size": 32,
+    "max_seq_length": 512
+  },
+  "data": {
+    "dataset": "occupation",
+    "root": "..",
+    "train_ratio": 0.5,
+    "val_ratio": 0.25,
+    "sensitive_train_count": 200,
+    "split_file": null
+  },
+  "text": {
+    "rounds": 3,
+    "tau_pre": 0.7,
+    "tau_neu": 0.7,
+    "max_input_chars": null
+  },
+  "memory": {
+    "k": 3,
+    "text_similarity_threshold": 0.9,
+    "topology_similarity_threshold": 0.9,
+    "enabled_text": true,
+    "enabled_topology": true
+  },
+  "gcn": {
+    "hidden_dim": 64,
+    "dropout": 0.5,
+    "lr": 0.01,
+    "weight_decay": 0.0005,
+    "epochs": 500,
+    "patience": 50
+  },
+  "topology": {
+    "k_minus": 5,
+    "k_plus": 5,
+    "task_weight": 0.5,
+    "edge_budget_per_node": 3,
+    "edge_budget": null,
+    "enabled": true
+  },
+  "downstream": {"train": true},
+  "datasets": {
+    "occupation": {
+      "directory": "occupations", "csv": "person.csv", "edges": "edges.txt",
+      "id_column": "id", "text_column": "tweet", "label_column": "flag", "sensitive_column": "gender",
+      "sensitive_mapping": {"female": 0, "male": 1},
+      "task_definition": "Binary occupation classification: 1 means computer-science-related occupation; 0 means other occupations. Preserve concrete work, technical skills, actions, negation and attribution.",
+      "sensitive_definition": "Gender-associated language. Do not guess or output a person's gender. Neutralize only cues that can change without losing occupation evidence."
+    },
+    "toy": {
+      "directory": "toys", "csv": "product.csv", "edges": "edges.txt",
+      "id_column": "id", "text_column": "review", "label_column": "label", "sensitive_column": "tendency",
+      "sensitive_mapping": {},
+      "task_definition": "Binary product-category classification. Class 1 (static) includes Arts & Crafts, Games, Dolls & Accessories, Building Toys, Stuffed Animals & Plush, and Puzzles. Class 0 contains remaining categories, including Learning & Education. Preserve product identity, function, usage and supported factual descriptions.",
+      "sensitive_definition": "High versus low average-rating groups (threshold 4.0). Identify rating-associated evaluative language; do not infer a node's group. Preserve task-relevant facts, opinions, intensity and negation whenever neutralization would change meaning."
+    },
+    "clothing": {
+      "directory": "clothing", "csv": "product.csv", "edges": "edges.txt",
+      "id_column": "id", "text_column": "review", "label_column": "label", "sensitive_column": "tendency",
+      "sensitive_mapping": {},
+      "task_definition": "Binary product-audience classification: 1 means women's products; 0 means Men, Girls, Boys, Baby, Kids or Other categories. Preserve audience and category evidence, product function, factual descriptions and negation.",
+      "sensitive_definition": "High versus low average-rating groups (dataset mean threshold approximately 4.2391). Identify rating-associated evaluative language; do not infer the group. Product audience is task evidence, not the sensitive attribute, and must be preserved."
+    }
+  }
+}
