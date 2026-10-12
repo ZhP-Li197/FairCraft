@@ -1,11 +1,5 @@
 # Run
 
-Run from the project root:
-
-```bash
-python -m pip install -r AgentFGL/requirements.txt
-```
-
 Set `llm.base_url` and `llm.model` in `AgentFGL/config.json`, then run:
 
 ```bash
