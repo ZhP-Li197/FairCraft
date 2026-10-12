@@ -1,6 +1,6 @@
 # Run
 
-Set `llm.base_url` and `llm.model` in `AgentFGL/config.json`, then run:
+Set `llm.base_url` and `llm.model` in `config.json`, then run:
 
 ```bash
 export FAIRCRAFT_API_KEY='your-api-key'
